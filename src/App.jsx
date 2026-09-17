@@ -451,6 +451,156 @@ function extractEdgeInfo(element) {
   return null;
 }
 
+
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
+}
+
+function highlightMermaidLine(line) {
+  const tokenRe = /%%.*$|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|https?:\/\/[^\s"']+|-->|==>|-\.->|---|@\{|\b(?:flowchart|graph|subgraph|end|direction|config|layout|classDef|class|style|linkStyle)\b|\b[A-Za-z_][A-Za-z0-9_-]*(?=\s*(?:@\{|\[|\(|\{|-->|==>|-\.->|&))|[\[\]{}()&]/g;
+  let out = "";
+  let last = 0;
+  for (const match of line.matchAll(tokenRe)) {
+    out += escapeHtml(line.slice(last, match.index));
+    const token = match[0];
+    let cls = "tok-punc";
+    if (token.startsWith("%%")) cls = "tok-comment";
+    else if (token.startsWith('"') || token.startsWith("'")) cls = "tok-string";
+    else if (/^https?:\/\//.test(token)) cls = "tok-url";
+    else if (/^(-->|==>|-\.->)$/.test(token)) cls = "tok-arrow";
+    else if (/^(flowchart|graph|subgraph|end|direction|config|layout|classDef|class|style|linkStyle)$/.test(token)) cls = "tok-keyword";
+    else if (/^[A-Za-z_][A-Za-z0-9_-]*$/.test(token)) cls = "tok-id";
+    else if (token === "@{") cls = "tok-directive";
+    out += `<span class="${cls}">${escapeHtml(token)}</span>`;
+    last = match.index + token.length;
+  }
+  out += escapeHtml(line.slice(last));
+  return out || " ";
+}
+
+function highlightMermaid(code) {
+  return String(code ?? "").split("\n").map(highlightMermaidLine).join("\n");
+}
+
+function organizeMermaidCode(code) {
+  const original = String(code ?? "").replace(/\r\n/g, "\n");
+  const all = original.split("\n");
+  let index = 0;
+  const front = [];
+
+  while (index < all.length && !all[index].trim()) index += 1;
+  if (all[index]?.trim() === "---") {
+    front.push(all[index++]);
+    while (index < all.length) {
+      front.push(all[index]);
+      if (all[index].trim() === "---" && front.length > 1) {
+        index += 1;
+        break;
+      }
+      index += 1;
+    }
+  }
+
+  while (index < all.length && !all[index].trim()) index += 1;
+  const headerIndex = all.slice(index).findIndex((line) => /^\s*(flowchart|graph)\b/i.test(line));
+  if (headerIndex < 0) return original;
+  const actualHeader = index + headerIndex;
+  const prefix = all.slice(index, actualHeader).filter((line) => line.trim());
+  const header = all[actualHeader].trim();
+  const body = all.slice(actualHeader + 1);
+
+  const subgraphs = [];
+  const remaining = [];
+  for (let i = 0; i < body.length;) {
+    if (/^\s*subgraph\b/i.test(body[i])) {
+      const block = [body[i]];
+      let depth = 1;
+      i += 1;
+      while (i < body.length && depth > 0) {
+        const line = body[i];
+        if (/^\s*subgraph\b/i.test(line)) depth += 1;
+        if (/^\s*end\s*$/i.test(line)) depth -= 1;
+        block.push(line);
+        i += 1;
+      }
+      subgraphs.push(block.join("\n").trimEnd());
+      continue;
+    }
+    remaining.push(body[i]);
+    i += 1;
+  }
+
+  const nodes = [];
+  const connections = [];
+  const shapes = [];
+  const other = [];
+  for (const raw of remaining) {
+    const line = raw.trimEnd();
+    const t = line.trim();
+    if (!t) continue;
+    if (/^[A-Za-z_][A-Za-z0-9_-]*\s*@\{\s*shape\s*:/i.test(t)) shapes.push(`    ${t}`);
+    else if (/(-->|==>|-\.->|---)/.test(t)) connections.push(`    ${t}`);
+    else if (/^[A-Za-z_][A-Za-z0-9_-]*\s*(?:@\{|\[|\(|\{)/.test(t)) nodes.push(`    ${t}`);
+    else other.push(`    ${t}`);
+  }
+
+  const sections = [];
+  if (front.length) sections.push(front.join("\n"));
+  if (prefix.length) sections.push(prefix.join("\n"));
+  sections.push(header);
+  if (subgraphs.length) sections.push(subgraphs.join("\n\n"));
+  if (nodes.length) sections.push(nodes.join("\n"));
+  if (connections.length) sections.push(connections.join("\n"));
+  if (shapes.length) sections.push(shapes.join("\n"));
+  if (other.length) sections.push(other.join("\n"));
+  return `${sections.filter(Boolean).join("\n\n").trimEnd()}\n`;
+}
+
+function HighlightedCodeEditor({ value, onChange, onBlur, editorRef }) {
+  const backdropRef = useRef(null);
+  const lineNumberRef = useRef(null);
+  const lineCount = Math.max(1, String(value ?? "").split("\n").length);
+
+  const syncScroll = (event) => {
+    const el = event.currentTarget;
+    if (backdropRef.current) {
+      backdropRef.current.style.transform = `translate(${-el.scrollLeft}px, ${-el.scrollTop}px)`;
+    }
+    if (lineNumberRef.current) {
+      lineNumberRef.current.style.transform = `translateY(${-el.scrollTop}px)`;
+    }
+  };
+
+  return (
+    <div className="code-editor-shell">
+      <div className="code-line-gutter" aria-hidden="true">
+        <div ref={lineNumberRef} className="code-line-numbers">
+          {Array.from({ length: lineCount }, (_, i) => <span key={i}>{i + 1}</span>)}
+        </div>
+      </div>
+      <div className="code-highlight-viewport" aria-hidden="true">
+        <pre ref={backdropRef} className="code-highlight" dangerouslySetInnerHTML={{ __html: highlightMermaid(value) }} />
+      </div>
+      <textarea
+        ref={editorRef}
+        className="code-editor code-editor-overlay"
+        spellCheck="false"
+        wrap="off"
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        onBlur={onBlur}
+        onScroll={syncScroll}
+        aria-label="Mermaid code"
+      />
+    </div>
+  );
+}
+
 export default function App() {
   const firstLoad = useMemo(() => loadProjects(), []);
   const [projects, setProjects] = useState(firstLoad);
@@ -464,6 +614,9 @@ export default function App() {
   const [nodeShape, setNodeShape] = useState("rect");
   const [nodeTarget, setNodeTarget] = useState("");
   const [newSubgraphTitle, setNewSubgraphTitle] = useState("Nhóm mới");
+  const [newNodeLabel, setNewNodeLabel] = useState("Node mới");
+  const [newNodeShape, setNewNodeShape] = useState("rect");
+  const [newNodeSubgraph, setNewNodeSubgraph] = useState("");
   const [inlineEdit, setInlineEdit] = useState(null);
   const [inlineSubgraphEdit, setInlineSubgraphEdit] = useState(null);
   const [view, setView] = useState({ x: 0, y: 0, scale: 1 });
@@ -651,11 +804,14 @@ export default function App() {
         event.preventDefault();
         event.stopPropagation();
         const { nodeId, def } = selectNode(node);
+        const nodeRect = node.getBoundingClientRect();
         setInlineEdit({
           id: nodeId,
           value: def.label || nodeId,
-          x: Math.max(8, Math.min(bounds.width - 260, event.clientX - bounds.left + 12)),
-          y: Math.max(8, Math.min(bounds.height - 90, event.clientY - bounds.top + 12))
+          x: Math.max(2, nodeRect.left - bounds.left),
+          y: Math.max(2, nodeRect.top - bounds.top),
+          width: Math.max(90, nodeRect.width),
+          height: Math.max(36, nodeRect.height)
         });
         return;
       }
@@ -665,11 +821,16 @@ export default function App() {
         event.preventDefault();
         event.stopPropagation();
         setSelected({ type: "subgraph", id: group.id });
+        const cluster = event.target.closest?.("g.cluster");
+        const labelEl = cluster?.querySelector?.(".cluster-label") || cluster;
+        const labelRect = labelEl?.getBoundingClientRect?.() || cluster?.getBoundingClientRect?.();
         setInlineSubgraphEdit({
           id: group.id,
           value: group.title,
-          x: Math.max(8, Math.min(bounds.width - 300, event.clientX - bounds.left + 12)),
-          y: Math.max(8, Math.min(bounds.height - 90, event.clientY - bounds.top + 12))
+          x: Math.max(2, (labelRect?.left || event.clientX) - bounds.left),
+          y: Math.max(2, (labelRect?.top || event.clientY) - bounds.top),
+          width: Math.max(120, labelRect?.width || 220),
+          height: Math.max(32, labelRect?.height || 38)
         });
       }
     };
@@ -890,8 +1051,8 @@ export default function App() {
     ));
   }
 
-  function updateCode(code) {
-    updateActive({ code });
+  function updateCode(code, organize = true) {
+    updateActive({ code: organize ? organizeMermaidCode(code) : code });
   }
 
   function createProject() {
@@ -950,9 +1111,17 @@ export default function App() {
     setActiveId(p.id);
   }
 
-  function addNode(connectFromSelected = false, shapeValue = "rect", forcedTarget = null) {
+  function createNodeFromSidebar() {
+    const label = safeLabel(newNodeLabel || "Node mới");
+    const target = newNodeSubgraph || "";
+    addNode(false, newNodeShape, target, label);
+    setNewNodeLabel("Node mới");
+  }
+
+  function addNode(connectFromSelected = false, shapeValue = "rect", forcedTarget = null, forcedLabel = null) {
     const nodeId = nextNodeId(active.code);
-    const declaration = nodeSyntax(nodeId, `Node ${nodeId}`, shapeValue);
+    const label = forcedLabel || `Node ${nodeId}`;
+    const declaration = nodeSyntax(nodeId, label, shapeValue);
     const target = forcedTarget ?? (selected?.type === "subgraph" ? selected.id : "");
     let code = target
       ? insertIntoSubgraph(active.code, target, declaration)
@@ -966,7 +1135,7 @@ export default function App() {
 
     updateCode(code);
     setSelected({ type: "node", id: nodeId });
-    setNodeLabel(`Node ${nodeId}`);
+    setNodeLabel(label);
     setNodeShape(shapeValue);
     setNodeTarget(target || "");
   }
@@ -1104,7 +1273,7 @@ export default function App() {
       <header className="topbar">
         <div className="brand">
           <div className="brand-mark">M</div>
-          <div><strong>Mermaid Live Lite v5</strong><span>Visual editor + Mermaid source</span></div>
+          <div><strong>Mermaid Live Lite v6</strong><span>Visual editor + Mermaid source</span></div>
         </div>
 
         <div className="toolbar">
@@ -1131,16 +1300,37 @@ export default function App() {
               </div>
             ))}
           </div>
-          <div className="palette-section">
-            <div className="palette-title">Thêm node</div>
-            <div className="shape-palette">
+          <div className="palette-section add-node-panel">
+            <div className="palette-title-row">
+              <div>
+                <div className="palette-title">Thêm node mới</div>
+                <small>Chọn hình dạng, tên và vùng chứa trước khi tạo.</small>
+              </div>
+            </div>
+            <label className="sidebar-field">Tên node
+              <input className="sidebar-input" value={newNodeLabel} onChange={(e) => setNewNodeLabel(e.target.value)} placeholder="Ví dụ: Kiểm tra API" />
+            </label>
+            <div className="shape-palette compact-shapes">
               {SHAPES.map((shape) => (
-                <button key={shape.value} className="shape-button" onClick={() => addNode(false, shape.value)} title={`Thêm ${shape.label}`}>
+                <button
+                  key={shape.value}
+                  className={`shape-button ${newNodeShape === shape.value ? "selected" : ""}`}
+                  onClick={() => setNewNodeShape(shape.value)}
+                  title={shape.label}
+                  type="button"
+                >
                   <span className={`shape-preview shape-${shape.value}`}></span>
                   <small>{shape.label}</small>
                 </button>
               ))}
             </div>
+            <label className="sidebar-field">Thêm vào
+              <select className="sidebar-input" value={newNodeSubgraph} onChange={(e) => setNewNodeSubgraph(e.target.value)}>
+                <option value="">Canvas chính</option>
+                {subgraphs.map((group) => <option key={group.id} value={group.id}>{group.title}</option>)}
+              </select>
+            </label>
+            <button className="primary create-node-button" onClick={createNodeFromSidebar}>＋ Tạo node</button>
           </div>
           <div className="palette-section">
             <div className="palette-title">Subgraph</div>
@@ -1153,9 +1343,17 @@ export default function App() {
         <section className="editor-pane">
           <div className="pane-header">
             <input className="title-input" value={active.name} onChange={(e) => updateActive({ name: e.target.value })} aria-label="Tên sơ đồ" />
-            <span className="status">{error ? "Syntax error" : "Live"}</span>
+            <div className="code-header-actions">
+              <button className="organize-code-button" onClick={() => updateCode(active.code, true)} title="Gom subgraph, node, connections và shape theo từng vùng">Sắp xếp code</button>
+              <span className="status">{error ? "Syntax error" : "Live"}</span>
+            </div>
           </div>
-          <textarea ref={codeEditorRef} className="code-editor" spellCheck="false" value={active.code} onChange={(e) => updateCode(e.target.value)} aria-label="Mermaid code" />
+          <HighlightedCodeEditor
+            value={active.code}
+            editorRef={codeEditorRef}
+            onChange={(code) => updateCode(code, false)}
+            onBlur={() => updateCode(active.code, true)}
+          />
           {error && <div className="error-box"><strong>Mermaid không render được</strong><pre>{error}</pre></div>}
         </section>
 
@@ -1246,34 +1444,40 @@ export default function App() {
             )}
 
             {inlineEdit && (
-              <div className="inline-node-editor" style={{ left: inlineEdit.x, top: inlineEdit.y }}>
+              <div
+                className="inline-direct-editor"
+                style={{ left: inlineEdit.x, top: inlineEdit.y, width: inlineEdit.width, height: inlineEdit.height }}
+                onPointerDown={(e) => e.stopPropagation()}
+              >
                 <input
                   autoFocus
                   value={inlineEdit.value}
                   onChange={(e) => setInlineEdit((v) => ({ ...v, value: e.target.value }))}
+                  onBlur={commitInlineEdit}
                   onKeyDown={(e) => {
-                    if (e.key === "Enter") commitInlineEdit();
+                    if (e.key === "Enter") e.currentTarget.blur();
                     if (e.key === "Escape") setInlineEdit(null);
                   }}
                 />
-                <button className="primary" onClick={commitInlineEdit}>Lưu</button>
-                <button onClick={() => setInlineEdit(null)}>Hủy</button>
               </div>
             )}
 
             {inlineSubgraphEdit && (
-              <div className="inline-node-editor" style={{ left: inlineSubgraphEdit.x, top: inlineSubgraphEdit.y }}>
+              <div
+                className="inline-direct-editor inline-subgraph-title-editor"
+                style={{ left: inlineSubgraphEdit.x, top: inlineSubgraphEdit.y, width: inlineSubgraphEdit.width, height: inlineSubgraphEdit.height }}
+                onPointerDown={(e) => e.stopPropagation()}
+              >
                 <input
                   autoFocus
                   value={inlineSubgraphEdit.value}
                   onChange={(e) => setInlineSubgraphEdit((v) => ({ ...v, value: e.target.value }))}
+                  onBlur={commitSubgraphInlineEdit}
                   onKeyDown={(e) => {
-                    if (e.key === "Enter") commitSubgraphInlineEdit();
+                    if (e.key === "Enter") e.currentTarget.blur();
                     if (e.key === "Escape") setInlineSubgraphEdit(null);
                   }}
                 />
-                <button className="primary" onClick={commitSubgraphInlineEdit}>Lưu</button>
-                <button onClick={() => setInlineSubgraphEdit(null)}>Hủy</button>
               </div>
             )}
           </div>
