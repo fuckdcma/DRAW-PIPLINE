@@ -179,9 +179,35 @@ function moveNodeToSubgraph(code, nodeId, targetSubgraphId) {
     : insertAtRoot(output, `    ${declaration}`);
 }
 
-function addSubgraphToCode(code, subgraphId, title) {
-  const block = `\n    subgraph ${subgraphId}[${safeLabel(title)}]\n    end`;
+function addSubgraphToCode(code, subgraphId, title, defaultNodeId) {
+  const nodeId = defaultNodeId || "N1";
+  const block = `\n    subgraph ${subgraphId}[${safeLabel(title)}]\n        ${nodeSyntax(nodeId, "Untitled Node", "rect")}\n    end`;
   return `${code.trimEnd()}${block}\n`;
+}
+
+function addEdgeToCode(code, sourceId, targetId) {
+  if (!sourceId || !targetId || sourceId === targetId) return code;
+  const edgePattern = new RegExp(`(^|\n)\s*${escapeRegExp(sourceId)}\s*--+>\s*${escapeRegExp(targetId)}(?:\s|$)`, "m");
+  if (edgePattern.test(code)) return code;
+  return `${code.trimEnd()}\n    ${sourceId} --> ${targetId}\n`;
+}
+
+function removeNodeFromCode(code, nodeId) {
+  const sid = escapeRegExp(nodeId);
+  const lines = code.split("\n");
+  const nodeToken = new RegExp(`(^|[^A-Za-z0-9_-])${sid}([^A-Za-z0-9_-]|$)`);
+  const declarationOnly = new RegExp(`^\s*${sid}(?:\s*[\[({])`);
+
+  return lines
+    .filter((line) => {
+      if (!nodeToken.test(line)) return true;
+      // Delete all edges involving the node. This intentionally disconnects it.
+      if (/-->|---|==>|-.->|~~~/.test(line)) return false;
+      // Delete a standalone node declaration.
+      if (declarationOnly.test(line)) return false;
+      return true;
+    })
+    .join("\n");
 }
 
 function nextNodeId(code) {
@@ -218,17 +244,27 @@ function findNodeSubgraph(code, nodeId) {
 }
 
 function extractNodeId(element) {
-  const dataId = element.getAttribute("data-id") || element.dataset?.id;
-  if (dataId) return dataId;
+  const explicit =
+    element.getAttribute("data-id") ||
+    element.getAttribute("data-node-id") ||
+    element.getAttribute("data-node") ||
+    element.dataset?.id;
+  if (explicit) return explicit;
+
   const raw = element.id || "";
-  const flowchartMatch = raw.match(/^flowchart-(.+?)-\d+$/);
+  // Mermaid may prefix generated SVG ids with the render id. We only want
+  // the logical id between `flowchart-` and the final numeric occurrence id.
+  const flowchartMatch = raw.match(/(?:^|-)flowchart-(.+?)-\d+$/);
   if (flowchartMatch) return flowchartMatch[1];
-  const nodeMatch = raw.match(/^(.+?)-\d+$/);
-  return nodeMatch ? nodeMatch[1] : raw;
+  return raw;
 }
 
 function extractClusterId(element) {
-  return element.getAttribute("data-id") || element.dataset?.id || element.id || "";
+  const explicit = element.getAttribute("data-id") || element.dataset?.id;
+  if (explicit) return explicit;
+  const raw = element.id || "";
+  const match = raw.match(/(?:^|-)cluster-(.+)$/);
+  return match ? match[1] : raw;
 }
 
 export default function App() {
@@ -246,11 +282,14 @@ export default function App() {
   const [newSubgraphTitle, setNewSubgraphTitle] = useState("Nhóm mới");
   const [inlineEdit, setInlineEdit] = useState(null);
   const [view, setView] = useState({ x: 0, y: 0, scale: 1 });
+  const [editorWidth, setEditorWidth] = useState(430);
+  const [connectionDrag, setConnectionDrag] = useState(null);
   const renderSeq = useRef(0);
   const fileInput = useRef(null);
   const viewportRef = useRef(null);
   const canvasRef = useRef(null);
   const panRef = useRef(null);
+  const splitterRef = useRef(null);
 
   const active = useMemo(
     () => projects.find((p) => p.id === activeId) ?? projects[0],
@@ -308,6 +347,39 @@ export default function App() {
 
     return () => clearTimeout(timer);
   }, [active?.code, active?.id, theme]);
+
+
+  useEffect(() => {
+    const viewport = viewportRef.current;
+    if (!viewport) return;
+
+    const onWheel = (event) => {
+      // Native non-passive handler is required so Ctrl+wheel never reaches
+      // Chrome's page zoom while the pointer is inside the canvas.
+      event.preventDefault();
+      event.stopPropagation();
+
+      if (event.ctrlKey || event.metaKey) {
+        const delta = event.deltaY < 0 ? 0.1 : -0.1;
+        setView((v) => ({
+          ...v,
+          scale: Math.min(3, Math.max(0.25, Number((v.scale + delta).toFixed(2))))
+        }));
+        return;
+      }
+
+      if (event.shiftKey) {
+        const amount = event.deltaY || event.deltaX;
+        setView((v) => ({ ...v, x: v.x - amount }));
+        return;
+      }
+
+      setView((v) => ({ ...v, y: v.y - event.deltaY }));
+    };
+
+    viewport.addEventListener("wheel", onWheel, { passive: false });
+    return () => viewport.removeEventListener("wheel", onWheel);
+  }, [active?.id]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -395,6 +467,103 @@ export default function App() {
 
   useEffect(() => {
     const canvas = canvasRef.current;
+    const viewport = viewportRef.current;
+    if (!canvas || !viewport || !svg) return;
+
+    canvas.querySelectorAll("g.visual-connect-handle").forEach((el) => el.remove());
+    if (selected?.type !== "node") return;
+
+    const node = Array.from(canvas.querySelectorAll("g.node")).find(
+      (el) => extractNodeId(el) === selected.id
+    );
+    if (!node) return;
+
+    let box;
+    try {
+      box = node.getBBox();
+    } catch {
+      return;
+    }
+
+    const ns = "http://www.w3.org/2000/svg";
+    const handle = document.createElementNS(ns, "g");
+    handle.setAttribute("class", "visual-connect-handle");
+    handle.setAttribute("transform", `translate(${box.x + box.width / 2}, ${box.y + box.height + 13})`);
+    handle.setAttribute("role", "button");
+    handle.setAttribute("aria-label", "Click để thêm node nối tiếp, hoặc kéo tới node khác để nối");
+
+    const circle = document.createElementNS(ns, "circle");
+    circle.setAttribute("r", "10");
+    const plus = document.createElementNS(ns, "text");
+    plus.setAttribute("x", "0");
+    plus.setAttribute("y", "4");
+    plus.setAttribute("text-anchor", "middle");
+    plus.textContent = "+";
+    handle.append(circle, plus);
+
+    const stopClick = (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+    };
+    handle.addEventListener("click", stopClick);
+    handle.addEventListener("dblclick", stopClick);
+
+    const onPointerDown = (event) => {
+      if (event.button !== 0) return;
+      event.preventDefault();
+      event.stopPropagation();
+
+      const viewportRect = viewport.getBoundingClientRect();
+      const handleRect = handle.getBoundingClientRect();
+      const x1 = handleRect.left + handleRect.width / 2 - viewportRect.left;
+      const y1 = handleRect.top + handleRect.height / 2 - viewportRect.top;
+      const startClientX = event.clientX;
+      const startClientY = event.clientY;
+
+      setConnectionDrag({ sourceId: selected.id, x1, y1, x2: x1, y2: y1 });
+
+      const onMove = (moveEvent) => {
+        setConnectionDrag((current) => current ? {
+          ...current,
+          x2: moveEvent.clientX - viewportRect.left,
+          y2: moveEvent.clientY - viewportRect.top
+        } : current);
+      };
+
+      const onUp = (upEvent) => {
+        window.removeEventListener("pointermove", onMove);
+        window.removeEventListener("pointerup", onUp);
+        setConnectionDrag(null);
+
+        const distance = Math.hypot(upEvent.clientX - startClientX, upEvent.clientY - startClientY);
+        const hit = document.elementFromPoint(upEvent.clientX, upEvent.clientY);
+        const targetNode = hit?.closest?.("g.node");
+        const targetId = targetNode ? extractNodeId(targetNode) : "";
+
+        if (targetId && targetId !== selected.id) {
+          updateCode(addEdgeToCode(active.code, selected.id, targetId));
+          return;
+        }
+
+        // A simple click on the + handle creates a new connected node.
+        if (distance < 8) addNode(true, "rect");
+      };
+
+      window.addEventListener("pointermove", onMove);
+      window.addEventListener("pointerup", onUp, { once: true });
+    };
+
+    handle.addEventListener("pointerdown", onPointerDown);
+    node.appendChild(handle);
+
+    return () => {
+      handle.removeEventListener("pointerdown", onPointerDown);
+      handle.remove();
+    };
+  }, [selected, svg, active?.code]);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
     if (!canvas || !svg) return;
 
     canvas.querySelectorAll("g.node").forEach((el) => {
@@ -446,13 +615,27 @@ export default function App() {
         addNodeToSubgraph(group.id, "rect");
       };
       btn.addEventListener("click", run);
-      btn.addEventListener("dblclick", run);
       btn.addEventListener("keydown", (event) => {
         if (event.key === "Enter" || event.key === " ") run(event);
       });
       cluster.appendChild(btn);
     });
   }, [svg, active?.visual, active?.code, subgraphs]);
+
+  useEffect(() => {
+    const viewport = viewportRef.current;
+    if (!viewport) return;
+    const onKeyDown = (event) => {
+      const tag = event.target?.tagName?.toLowerCase();
+      if (tag === "input" || tag === "textarea" || tag === "select" || event.target?.isContentEditable) return;
+      if ((event.key === "Delete" || event.key === "Backspace") && selected?.type === "node") {
+        event.preventDefault();
+        deleteSelectedNode();
+      }
+    };
+    viewport.addEventListener("keydown", onKeyDown);
+    return () => viewport.removeEventListener("keydown", onKeyDown);
+  }, [selected, active?.code]);
 
   function updateActive(patch) {
     if (!active) return;
@@ -577,9 +760,22 @@ export default function App() {
     updateCode(code);
   }
 
+  function deleteSelectedNode() {
+    if (selected?.type !== "node") return;
+    const nodeId = selected.id;
+    const code = removeNodeFromCode(active.code, nodeId);
+    const visual = active.visual || {};
+    const nodeSizes = { ...(visual.nodeSizes || {}) };
+    delete nodeSizes[nodeId];
+    updateActive({ code, visual: { ...visual, nodeSizes } });
+    setSelected(null);
+    setInlineEdit(null);
+  }
+
   function addSubgraph() {
     const sgId = nextSubgraphId(active.code);
-    updateCode(addSubgraphToCode(active.code, sgId, newSubgraphTitle || sgId));
+    const nodeId = nextNodeId(active.code);
+    updateCode(addSubgraphToCode(active.code, sgId, newSubgraphTitle || sgId, nodeId));
     setSelected({ type: "subgraph", id: sgId });
     setNodeTarget(sgId);
     setNewSubgraphTitle("Nhóm mới");
@@ -591,20 +787,6 @@ export default function App() {
 
   function resetView() {
     setView({ x: 0, y: 0, scale: 1 });
-  }
-
-  function handleWheel(event) {
-    event.preventDefault();
-    if (event.ctrlKey || event.metaKey) {
-      const factor = event.deltaY < 0 ? 0.1 : -0.1;
-      zoomBy(factor);
-      return;
-    }
-    if (event.shiftKey) {
-      setView((v) => ({ ...v, x: v.x - (event.deltaY || event.deltaX) }));
-      return;
-    }
-    setView((v) => ({ ...v, y: v.y - event.deltaY }));
   }
 
   function handlePointerDown(event) {
@@ -625,6 +807,25 @@ export default function App() {
     panRef.current = null;
   }
 
+  function handleSplitterPointerDown(event) {
+    event.preventDefault();
+    const startX = event.clientX;
+    const startWidth = editorWidth;
+    const target = event.currentTarget;
+    target.setPointerCapture?.(event.pointerId);
+
+    const onMove = (moveEvent) => {
+      const width = Math.max(280, Math.min(900, startWidth + moveEvent.clientX - startX));
+      setEditorWidth(width);
+    };
+    const onUp = () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp, { once: true });
+  }
+
   if (!active) return null;
 
   return (
@@ -632,7 +833,7 @@ export default function App() {
       <header className="topbar">
         <div className="brand">
           <div className="brand-mark">M</div>
-          <div><strong>Mermaid Live Lite v3</strong><span>Visual editor + Mermaid source</span></div>
+          <div><strong>Mermaid Live Lite v4</strong><span>Visual editor + Mermaid source</span></div>
         </div>
 
         <div className="toolbar">
@@ -648,7 +849,7 @@ export default function App() {
         </div>
       </header>
 
-      <main className="workspace">
+      <main className="workspace" style={{ "--editor-width": `${editorWidth}px` }}>
         <aside className="sidebar">
           <button className="new-project" onClick={createProject}>＋ Sơ đồ mới</button>
           <div className="project-list">
@@ -687,6 +888,14 @@ export default function App() {
           {error && <div className="error-box"><strong>Mermaid không render được</strong><pre>{error}</pre></div>}
         </section>
 
+        <div
+          className="pane-splitter"
+          ref={splitterRef}
+          onPointerDown={handleSplitterPointerDown}
+          title="Kéo để thay đổi chiều rộng vùng code"
+          aria-label="Resize code editor"
+        />
+
         <section className="preview-pane">
           <div className="pane-header visual-header">
             <strong>Visual Canvas</strong>
@@ -701,7 +910,7 @@ export default function App() {
           <div
             className="preview-scroll visual-viewport"
             ref={viewportRef}
-            onWheel={handleWheel}
+            tabIndex={0}
             onContextMenu={(e) => e.preventDefault()}
             onPointerDown={handlePointerDown}
             onPointerMove={handlePointerMove}
@@ -715,6 +924,45 @@ export default function App() {
             >
               {svg ? <div className="diagram" dangerouslySetInnerHTML={{ __html: svg }} /> : <div className="empty-state">Nhập Mermaid code để render sơ đồ.</div>}
             </div>
+
+            {connectionDrag && (
+              <svg className="connection-preview" aria-hidden="true">
+                <line
+                  x1={connectionDrag.x1}
+                  y1={connectionDrag.y1}
+                  x2={connectionDrag.x2}
+                  y2={connectionDrag.y2}
+                />
+              </svg>
+            )}
+
+            {selected?.type === "node" && (
+              <div className="node-popover" onPointerDown={(e) => e.stopPropagation()}>
+                <div className="node-popover-head">
+                  <strong>{selected.id}</strong>
+                  <button className="delete-node-button" onClick={deleteSelectedNode} title="Xóa node">×</button>
+                </div>
+                <label>Hình dạng
+                  <select value={nodeShape} onChange={(e) => setNodeShape(e.target.value)}>
+                    {SHAPES.map((shape) => <option key={shape.value} value={shape.value}>{shape.label}</option>)}
+                  </select>
+                </label>
+                <label>Subgraph
+                  <select value={nodeTarget} onChange={(e) => setNodeTarget(e.target.value)}>
+                    <option value="">Ngoài subgraph</option>
+                    {subgraphs.map((group) => <option key={group.id} value={group.id}>{group.title}</option>)}
+                  </select>
+                </label>
+                <div className="node-popover-actions">
+                  <button className="primary" onClick={applyNodeChanges}>Áp dụng</button>
+                  {nodeTarget && <button onClick={() => moveSelectedTo(nodeTarget)}>ADD</button>}
+                  {findNodeSubgraph(active.code, selected.id) && <button onClick={() => moveSelectedTo("")}>Remove</button>}
+                  <button className="danger-soft" onClick={deleteSelectedNode}>Delete</button>
+                </div>
+                <small>Double click node để sửa nội dung. Click dấu + để thêm node; kéo dấu + sang node khác để nối.</small>
+              </div>
+            )}
+
             {inlineEdit && (
               <div className="inline-node-editor" style={{ left: inlineEdit.x, top: inlineEdit.y }}>
                 <input
@@ -750,6 +998,7 @@ export default function App() {
                   <button onClick={() => moveSelectedTo(nodeTarget)} disabled={!nodeTarget}>ADD vào subgraph</button>
                   {findNodeSubgraph(active.code, selected.id) && <button className="danger-soft" onClick={() => moveSelectedTo("")}>Remove khỏi subgraph</button>}
                   <button onClick={() => addNode(true, "rect")}>Thêm node nối tiếp</button>
+                  <button className="danger-soft" onClick={deleteSelectedNode}>Delete node</button>
                 </div>
               </div>
             ) : selected?.type === "subgraph" ? (
