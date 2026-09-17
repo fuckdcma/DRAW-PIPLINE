@@ -244,6 +244,7 @@ export default function App() {
   const [nodeShape, setNodeShape] = useState("rect");
   const [nodeTarget, setNodeTarget] = useState("");
   const [newSubgraphTitle, setNewSubgraphTitle] = useState("Nhóm mới");
+  const [inlineEdit, setInlineEdit] = useState(null);
   const [view, setView] = useState({ x: 0, y: 0, scale: 1 });
   const renderSeq = useRef(0);
   const fileInput = useRef(null);
@@ -256,6 +257,9 @@ export default function App() {
     [projects, activeId]
   );
   const subgraphs = useMemo(() => parseSubgraphs(active?.code || ""), [active?.code]);
+  const selectedNodeSize = selected?.type === "node"
+    ? active?.visual?.nodeSizes?.[selected.id] ?? 100
+    : 100;
 
   useEffect(() => {
     if (!active && projects[0]) setActiveId(projects[0].id);
@@ -307,18 +311,25 @@ export default function App() {
 
   useEffect(() => {
     const canvas = canvasRef.current;
-    if (!canvas || !svg) return;
+    const viewport = viewportRef.current;
+    if (!canvas || !viewport || !svg) return;
+
+    const selectNode = (node) => {
+      const nodeId = extractNodeId(node);
+      const def = findNodeDefinition(active.code, nodeId);
+      setSelected({ type: "node", id: nodeId });
+      setNodeLabel(def.label || nodeId);
+      setNodeShape(def.shape || "rect");
+      setNodeTarget(findNodeSubgraph(active.code, nodeId));
+      return { nodeId, def };
+    };
 
     const onClick = (event) => {
+      if (event.target.closest?.("g.visual-subgraph-add")) return;
       const node = event.target.closest?.("g.node");
       if (node) {
         event.stopPropagation();
-        const nodeId = extractNodeId(node);
-        const def = findNodeDefinition(active.code, nodeId);
-        setSelected({ type: "node", id: nodeId });
-        setNodeLabel(def.label || nodeId);
-        setNodeShape(def.shape || "rect");
-        setNodeTarget(findNodeSubgraph(active.code, nodeId));
+        selectNode(node);
         return;
       }
 
@@ -338,8 +349,27 @@ export default function App() {
       setSelected(null);
     };
 
+    const onDoubleClick = (event) => {
+      const node = event.target.closest?.("g.node");
+      if (!node) return;
+      event.preventDefault();
+      event.stopPropagation();
+      const { nodeId, def } = selectNode(node);
+      const bounds = viewport.getBoundingClientRect();
+      setInlineEdit({
+        id: nodeId,
+        value: def.label || nodeId,
+        x: Math.max(8, Math.min(bounds.width - 260, event.clientX - bounds.left + 12)),
+        y: Math.max(8, Math.min(bounds.height - 90, event.clientY - bounds.top + 12))
+      });
+    };
+
     canvas.addEventListener("click", onClick);
-    return () => canvas.removeEventListener("click", onClick);
+    canvas.addEventListener("dblclick", onDoubleClick);
+    return () => {
+      canvas.removeEventListener("click", onClick);
+      canvas.removeEventListener("dblclick", onDoubleClick);
+    };
   }, [svg, active?.code, subgraphs]);
 
   useEffect(() => {
@@ -362,6 +392,67 @@ export default function App() {
       });
     }
   }, [selected, svg, subgraphs]);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas || !svg) return;
+
+    canvas.querySelectorAll("g.node").forEach((el) => {
+      const id = extractNodeId(el);
+      const percent = active?.visual?.nodeSizes?.[id] ?? 100;
+      const scale = Math.max(0.6, Math.min(1.8, percent / 100));
+      const baseTransform = el.getAttribute("data-base-transform") || el.getAttribute("transform") || "";
+      el.setAttribute("data-base-transform", baseTransform.replace(/\s+scale\([^)]*\)\s*$/, ""));
+      el.setAttribute("transform", `${el.getAttribute("data-base-transform")} scale(${scale})`.trim());
+    });
+
+    canvas.querySelectorAll("g.cluster").forEach((cluster) => {
+      cluster.querySelectorAll(":scope > g.visual-subgraph-add").forEach((el) => el.remove());
+      const cid = extractClusterId(cluster);
+      const group = subgraphs.find((item) => item.id === cid) ||
+        subgraphs.find((item) => cluster.textContent?.includes(item.title));
+      if (!group) return;
+      const rect = cluster.querySelector(":scope > rect");
+      if (!rect) return;
+      const x = Number(rect.getAttribute("x") || 0);
+      const y = Number(rect.getAttribute("y") || 0);
+      const width = Number(rect.getAttribute("width") || 0);
+      if (!Number.isFinite(width) || width < 90) return;
+
+      const ns = "http://www.w3.org/2000/svg";
+      const btn = document.createElementNS(ns, "g");
+      btn.setAttribute("class", "visual-subgraph-add");
+      btn.setAttribute("transform", `translate(${x + width - 78}, ${y + 7})`);
+      btn.setAttribute("role", "button");
+      btn.setAttribute("tabindex", "0");
+      btn.setAttribute("aria-label", `Thêm node vào ${group.title}`);
+
+      const bg = document.createElementNS(ns, "rect");
+      bg.setAttribute("width", "70");
+      bg.setAttribute("height", "24");
+      bg.setAttribute("rx", "6");
+      bg.setAttribute("class", "visual-subgraph-add-bg");
+      const text = document.createElementNS(ns, "text");
+      text.setAttribute("x", "35");
+      text.setAttribute("y", "16");
+      text.setAttribute("text-anchor", "middle");
+      text.setAttribute("class", "visual-subgraph-add-text");
+      text.textContent = "+ Node";
+      btn.append(bg, text);
+
+      const run = (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        addNodeToSubgraph(group.id, "rect");
+      };
+      btn.addEventListener("click", run);
+      btn.addEventListener("dblclick", run);
+      btn.addEventListener("keydown", (event) => {
+        if (event.key === "Enter" || event.key === " ") run(event);
+      });
+      cluster.appendChild(btn);
+    });
+  }, [svg, active?.visual, active?.code, subgraphs]);
 
   function updateActive(patch) {
     if (!active) return;
@@ -411,7 +502,8 @@ export default function App() {
 
   function exportSvg() {
     if (!active || !svg || error) return;
-    downloadBlob(new Blob([svg], { type: "image/svg+xml;charset=utf-8" }), `${safeFilename(active.name)}.svg`);
+    const rendered = canvasRef.current?.querySelector(".diagram svg")?.outerHTML || svg;
+    downloadBlob(new Blob([rendered], { type: "image/svg+xml;charset=utf-8" }), `${safeFilename(active.name)}.svg`);
   }
 
   function openImport() {
@@ -429,23 +521,29 @@ export default function App() {
     setActiveId(p.id);
   }
 
-  function addNode(connectFromSelected = false) {
+  function addNode(connectFromSelected = false, shapeValue = "rect", forcedTarget = null) {
     const nodeId = nextNodeId(active.code);
-    const declaration = nodeSyntax(nodeId, `Node ${nodeId}`, "rect");
-    const target = selected?.type === "subgraph" ? selected.id : nodeTarget;
+    const declaration = nodeSyntax(nodeId, `Node ${nodeId}`, shapeValue);
+    const target = forcedTarget ?? (selected?.type === "subgraph" ? selected.id : "");
     let code = target
       ? insertIntoSubgraph(active.code, target, declaration)
       : insertAtRoot(active.code, `    ${declaration}`);
 
     if (connectFromSelected && selected?.type === "node") {
-      code = `${code.trimEnd()}\n    ${selected.id} --> ${nodeId}\n`;
+      code = `${code.trimEnd()}
+    ${selected.id} --> ${nodeId}
+`;
     }
 
     updateCode(code);
     setSelected({ type: "node", id: nodeId });
     setNodeLabel(`Node ${nodeId}`);
-    setNodeShape("rect");
+    setNodeShape(shapeValue);
     setNodeTarget(target || "");
+  }
+
+  function addNodeToSubgraph(subgraphId, shapeValue = "rect") {
+    addNode(false, shapeValue, subgraphId);
   }
 
   function applyNodeChanges() {
@@ -453,6 +551,23 @@ export default function App() {
     let code = replaceNodeDefinition(active.code, selected.id, nodeLabel, nodeShape);
     code = moveNodeToSubgraph(code, selected.id, nodeTarget);
     updateCode(code);
+  }
+
+  function commitInlineEdit() {
+    if (!inlineEdit?.id) return;
+    const def = findNodeDefinition(active.code, inlineEdit.id);
+    const code = replaceNodeDefinition(active.code, inlineEdit.id, inlineEdit.value, def.shape);
+    updateCode(code);
+    setNodeLabel(safeLabel(inlineEdit.value));
+    setInlineEdit(null);
+  }
+
+  function setNodeSize(percent) {
+    if (selected?.type !== "node") return;
+    const size = Math.max(60, Math.min(180, Number(percent) || 100));
+    const visual = active.visual || {};
+    const nodeSizes = { ...(visual.nodeSizes || {}), [selected.id]: size };
+    updateActive({ visual: { ...visual, nodeSizes } });
   }
 
   function moveSelectedTo(target) {
@@ -479,14 +594,23 @@ export default function App() {
   }
 
   function handleWheel(event) {
-    if (!event.ctrlKey && !event.metaKey) return;
     event.preventDefault();
-    zoomBy(event.deltaY < 0 ? 0.1 : -0.1);
+    if (event.ctrlKey || event.metaKey) {
+      const factor = event.deltaY < 0 ? 0.1 : -0.1;
+      zoomBy(factor);
+      return;
+    }
+    if (event.shiftKey) {
+      setView((v) => ({ ...v, x: v.x - (event.deltaY || event.deltaX) }));
+      return;
+    }
+    setView((v) => ({ ...v, y: v.y - event.deltaY }));
   }
 
   function handlePointerDown(event) {
-    if (event.button !== 0) return;
-    if (event.target.closest?.("g.node, g.cluster, button, input, select, textarea")) return;
+    if (event.button !== 2) return;
+    if (event.target.closest?.("button, input, select, textarea")) return;
+    event.preventDefault();
     panRef.current = { startX: event.clientX, startY: event.clientY, x: view.x, y: view.y };
     event.currentTarget.setPointerCapture?.(event.pointerId);
   }
@@ -508,12 +632,12 @@ export default function App() {
       <header className="topbar">
         <div className="brand">
           <div className="brand-mark">M</div>
-          <div><strong>Mermaid Live Lite</strong><span>Visual editor + Mermaid source</span></div>
+          <div><strong>Mermaid Live Lite v3</strong><span>Visual editor + Mermaid source</span></div>
         </div>
 
         <div className="toolbar">
-          <button onClick={() => addNode(false)}>＋ Node</button>
-          <button onClick={() => addNode(true)} disabled={selected?.type !== "node"}>＋ Node nối tiếp</button>
+          <button onClick={() => addNode(false, "rect")}>＋ Node</button>
+          <button onClick={() => addNode(true, "rect")} disabled={selected?.type !== "node"}>＋ Node nối tiếp</button>
           <button onClick={addSubgraph}>＋ Subgraph</button>
           <button onClick={copyCode}>{copied ? "Đã copy" : "Copy code"}</button>
           <button onClick={openImport}>Import .mmd</button>
@@ -535,7 +659,23 @@ export default function App() {
               </div>
             ))}
           </div>
-          <div className="sidebar-note">Click node/subgraph trực tiếp trên canvas để chỉnh. Kéo vùng trống để di chuyển; Ctrl + lăn chuột để zoom.</div>
+          <div className="palette-section">
+            <div className="palette-title">Thêm node</div>
+            <div className="shape-palette">
+              {SHAPES.map((shape) => (
+                <button key={shape.value} className="shape-button" onClick={() => addNode(false, shape.value)} title={`Thêm ${shape.label}`}>
+                  <span className={`shape-preview shape-${shape.value}`}></span>
+                  <small>{shape.label}</small>
+                </button>
+              ))}
+            </div>
+          </div>
+          <div className="palette-section">
+            <div className="palette-title">Subgraph</div>
+            <input className="sidebar-input" value={newSubgraphTitle} onChange={(e) => setNewSubgraphTitle(e.target.value)} placeholder="Tên subgraph" />
+            <button className="new-subgraph-button" onClick={addSubgraph}>＋ Thêm subgraph</button>
+          </div>
+          <div className="sidebar-note">Chuột phải + kéo: PAN · Cuộn: lên/xuống · Shift + cuộn: trái/phải · Ctrl + cuộn: zoom · Double click node: sửa tên.</div>
         </aside>
 
         <section className="editor-pane">
@@ -562,6 +702,7 @@ export default function App() {
             className="preview-scroll visual-viewport"
             ref={viewportRef}
             onWheel={handleWheel}
+            onContextMenu={(e) => e.preventDefault()}
             onPointerDown={handlePointerDown}
             onPointerMove={handlePointerMove}
             onPointerUp={handlePointerUp}
@@ -574,6 +715,21 @@ export default function App() {
             >
               {svg ? <div className="diagram" dangerouslySetInnerHTML={{ __html: svg }} /> : <div className="empty-state">Nhập Mermaid code để render sơ đồ.</div>}
             </div>
+            {inlineEdit && (
+              <div className="inline-node-editor" style={{ left: inlineEdit.x, top: inlineEdit.y }}>
+                <input
+                  autoFocus
+                  value={inlineEdit.value}
+                  onChange={(e) => setInlineEdit((v) => ({ ...v, value: e.target.value }))}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") commitInlineEdit();
+                    if (e.key === "Escape") setInlineEdit(null);
+                  }}
+                />
+                <button className="primary" onClick={commitInlineEdit}>Lưu</button>
+                <button onClick={() => setInlineEdit(null)}>Hủy</button>
+              </div>
+            )}
           </div>
 
           <div className="inspector">
@@ -587,17 +743,19 @@ export default function App() {
                 <label>ID<input value={selected.id} disabled /></label>
                 <label>Nhãn<input value={nodeLabel} onChange={(e) => setNodeLabel(e.target.value)} /></label>
                 <label>Hình dạng<select value={nodeShape} onChange={(e) => setNodeShape(e.target.value)}>{SHAPES.map((shape) => <option key={shape.value} value={shape.value}>{shape.label}</option>)}</select></label>
-                <label>Thuộc subgraph<select value={nodeTarget} onChange={(e) => setNodeTarget(e.target.value)}><option value="">Root / ngoài subgraph</option>{subgraphs.map((group) => <option key={group.id} value={group.id}>{group.title} ({group.id})</option>)}</select></label>
+                <label>ADD vào subgraph<select value={nodeTarget} onChange={(e) => setNodeTarget(e.target.value)}><option value="">Chọn subgraph…</option>{subgraphs.map((group) => <option key={group.id} value={group.id}>{group.title} ({group.id})</option>)}</select></label>
+                <label className="size-control">Kích cỡ: {selectedNodeSize}%<input type="range" min="60" max="180" step="5" value={selectedNodeSize} onChange={(e) => setNodeSize(e.target.value)} /></label>
                 <div className="inspector-actions">
-                  <button className="primary" onClick={applyNodeChanges}>Áp dụng</button>
-                  <button onClick={() => moveSelectedTo(nodeTarget)}>Di chuyển vào nhóm</button>
-                  <button onClick={() => addNode(true)}>Thêm node nối tiếp</button>
+                  <button className="primary" onClick={applyNodeChanges}>Áp dụng tên / shape</button>
+                  <button onClick={() => moveSelectedTo(nodeTarget)} disabled={!nodeTarget}>ADD vào subgraph</button>
+                  {findNodeSubgraph(active.code, selected.id) && <button className="danger-soft" onClick={() => moveSelectedTo("")}>Remove khỏi subgraph</button>}
+                  <button onClick={() => addNode(true, "rect")}>Thêm node nối tiếp</button>
                 </div>
               </div>
             ) : selected?.type === "subgraph" ? (
               <div className="subgraph-tools">
                 <p>Node mới sẽ được thêm trực tiếp vào <strong>{selected.id}</strong>.</p>
-                <button className="primary" onClick={() => addNode(false)}>＋ Thêm node vào subgraph</button>
+                <button className="primary" onClick={() => addNodeToSubgraph(selected.id, "rect")}>＋ Thêm node vào subgraph</button>
               </div>
             ) : (
               <div className="subgraph-tools">
