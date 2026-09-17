@@ -602,3 +602,61 @@ button:disabled { opacity: .45; cursor: not-allowed; }
   .pane-splitter { display: none; }
   .preview-pane { grid-column: 2; }
 }
+
+/* v5 interaction fixes */
+.code-editor {
+  overflow: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+}
+
+.canvas-stage g.edgePath,
+.canvas-stage path.flowchart-link,
+.canvas-stage .edgePaths path,
+.canvas-stage .edgePath path {
+  cursor: pointer;
+  pointer-events: stroke;
+}
+
+.canvas-stage g.visual-edge-selected path,
+.canvas-stage path.visual-edge-selected,
+.canvas-stage .visual-edge-selected {
+  stroke: var(--accent) !important;
+  stroke-width: 5px !important;
+  filter: drop-shadow(0 0 4px color-mix(in srgb, var(--accent) 60%, transparent));
+}
+
+.edge-popover {
+  border-color: var(--danger);
+}
+
+@media (min-width: 1051px) {
+  .app-shell {
+    height: 100vh;
+    min-height: 0;
+    overflow: hidden;
+  }
+  .workspace {
+    height: calc(100vh - 62px);
+    min-height: 0;
+    overflow: hidden;
+  }
+  .sidebar,
+  .editor-pane,
+  .preview-pane {
+    min-height: 0;
+  }
+  .sidebar {
+    overflow: auto;
+    overscroll-behavior: contain;
+  }
+  .editor-pane {
+    overflow: hidden;
+  }
+  .preview-pane {
+    overflow: hidden;
+  }
+  .visual-viewport {
+    min-height: 0;
+  }
+}
