@@ -223,3 +223,110 @@ button:disabled { opacity: .45; cursor: not-allowed; }
   .editor-pane { min-height: 60vh; border-right: 0; }
   .preview-pane { min-height: 60vh; }
 }
+
+/* Visual editing additions */
+.visual-header { gap: 12px; }
+.canvas-controls { display: flex; align-items: center; gap: 6px; }
+.canvas-controls button { min-width: 34px; padding: 6px 8px; }
+.canvas-controls span { min-width: 46px; text-align: center; color: var(--muted); font-size: 12px; }
+
+.visual-viewport {
+  position: relative;
+  min-height: 440px;
+  overflow: hidden;
+  cursor: grab;
+  touch-action: none;
+  background-image:
+    radial-gradient(circle at 1px 1px, color-mix(in srgb, var(--muted) 20%, transparent) 1px, transparent 0);
+  background-size: 22px 22px;
+}
+.visual-viewport:active { cursor: grabbing; }
+.canvas-stage {
+  transform-origin: 0 0;
+  width: max-content;
+  min-width: 100%;
+  min-height: 100%;
+  padding: 30px;
+  will-change: transform;
+}
+.canvas-stage .diagram { user-select: none; }
+.canvas-stage g.node,
+.canvas-stage g.cluster { cursor: pointer; }
+.canvas-stage g.node.visual-selected > rect,
+.canvas-stage g.node.visual-selected > circle,
+.canvas-stage g.node.visual-selected > ellipse,
+.canvas-stage g.node.visual-selected > polygon,
+.canvas-stage g.node.visual-selected > path,
+.canvas-stage g.cluster.visual-selected > rect {
+  stroke: var(--accent) !important;
+  stroke-width: 4px !important;
+  filter: drop-shadow(0 0 5px color-mix(in srgb, var(--accent) 55%, transparent));
+}
+
+.inspector {
+  border-top: 1px solid var(--border);
+  background: var(--panel);
+  padding: 12px;
+}
+.inspector-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+.inspector-title span { color: var(--muted); font-size: 12px; }
+.inspector-grid {
+  display: grid;
+  grid-template-columns: minmax(120px, .7fr) minmax(180px, 1.2fr) minmax(150px, .9fr) minmax(180px, 1.1fr);
+  gap: 9px;
+  align-items: end;
+}
+.inspector label,
+.subgraph-tools label {
+  display: grid;
+  gap: 5px;
+  color: var(--muted);
+  font-size: 11px;
+}
+.inspector input,
+.inspector select,
+.subgraph-tools input {
+  width: 100%;
+  min-width: 0;
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+  color: var(--text);
+  border-radius: 8px;
+  padding: 8px 9px;
+}
+.inspector input:focus,
+.inspector select:focus,
+.subgraph-tools input:focus { outline: 2px solid color-mix(in srgb, var(--accent) 35%, transparent); border-color: var(--accent); }
+.inspector-actions {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: white;
+  font-weight: 700;
+}
+.subgraph-tools { display: flex; flex-wrap: wrap; align-items: end; gap: 10px; }
+.subgraph-tools label { min-width: 220px; flex: 1; }
+.subgraph-tools p { margin: 0; color: var(--muted); font-size: 12px; line-height: 1.5; }
+
+@media (max-width: 1280px) {
+  .inspector-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
+@media (max-width: 720px) {
+  .visual-header { height: auto; min-height: 48px; flex-wrap: wrap; }
+  .canvas-controls { flex-wrap: wrap; }
+  .visual-viewport { min-height: 380px; }
+  .inspector-grid { grid-template-columns: 1fr; }
+  .inspector-actions { grid-column: auto; }
+}
