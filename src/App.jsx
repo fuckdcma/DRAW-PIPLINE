@@ -29,6 +29,24 @@ const SHAPES = [
   { value: "hexagon", label: "Lục giác", open: "{{", close: "}}" }
 ];
 
+const SHAPE_DIRECTIVES = {
+  rect: "rect",
+  rounded: "rounded",
+  stadium: "stadium",
+  subroutine: "subroutine",
+  cylinder: "cyl",
+  circle: "circle",
+  diamond: "diam",
+  hexagon: "hex"
+};
+
+function mermaidString(value) {
+  return String(value ?? "")
+    .replace(/\\/g, "\\\\")
+    .replace(/"/g, '\\"')
+    .replace(/[\r\n]+/g, " ");
+}
+
 function uid() {
   return crypto.randomUUID?.() ?? `${Date.now()}-${Math.random()}`;
 }
@@ -90,7 +108,9 @@ function parseSubgraphs(code) {
   lines.forEach((line, index) => {
     const match = line.match(/^\s*subgraph\s+([A-Za-z0-9_-]+)(?:\s*\[([^\]]*)\])?\s*$/i);
     if (match) {
-      stack.push({ id: match[1], title: match[2] || match[1], start: index });
+      const rawTitle = (match[2] || match[1]).trim();
+      const title = rawTitle.replace(/^(["'])|(["'])$/g, "") || match[1];
+      stack.push({ id: match[1], title, start: index });
       return;
     }
     if (/^\s*end\s*$/i.test(line) && stack.length) {
@@ -110,11 +130,36 @@ function shapeRegex(shape, nodeId) {
 }
 
 function findNodeDefinition(code, nodeId) {
+  const sid = escapeRegExp(nodeId);
+
+  // Mermaid's newer generic node syntax: n1@{ label: "Text" }
+  const generic = code.match(new RegExp(`(^|\\n)\\s*${sid}\\s*@\\{([\\s\\S]*?)\\}`, "m"));
+  let genericLabel = "";
+  if (generic) {
+    const quoted = generic[2].match(/\blabel\s*:\s*"((?:\\.|[^"\\])*)"/i);
+    if (quoted) {
+      try { genericLabel = JSON.parse(`"${quoted[1]}"`); } catch { genericLabel = quoted[1]; }
+    }
+  }
+
+  let directiveShape = "";
+  const directives = Array.from(code.matchAll(new RegExp(`(^|\\n)\\s*${sid}\\s*@\\{([^}]*)\\}`, "gmi")));
+  for (const match of directives) {
+    const shapeMatch = match[2].match(/\bshape\s*:\s*([A-Za-z0-9_-]+)/i);
+    if (shapeMatch) {
+      const raw = shapeMatch[1].toLowerCase();
+      directiveShape = Object.entries(SHAPE_DIRECTIVES).find(([, value]) => value === raw)?.[0] ||
+        ({ decision: "diamond", cylinder: "cylinder" }[raw] || "rect");
+    }
+  }
+
   for (const shape of SHAPES.slice().sort((a, b) => b.open.length - a.open.length)) {
     const match = code.match(shapeRegex(shape, nodeId));
-    if (match) return { shape: shape.value, label: match[3], match };
+    if (match) return { shape: directiveShape || shape.value, label: genericLabel || match[3], match };
   }
-  return { shape: "rect", label: nodeId };
+
+  if (generic) return { shape: directiveShape || "rect", label: genericLabel || nodeId, match: generic };
+  return { shape: directiveShape || "rect", label: nodeId };
 }
 
 function nodeSyntax(nodeId, label, shapeValue) {
@@ -123,14 +168,39 @@ function nodeSyntax(nodeId, label, shapeValue) {
 }
 
 function replaceNodeDefinition(code, nodeId, label, shapeValue) {
-  const replacement = nodeSyntax(nodeId, label, shapeValue);
+  const sid = escapeRegExp(nodeId);
+  const cleanLabel = safeLabel(label);
+  let output = code;
+
+  // Preserve Mermaid's generic @{ label: ... } syntax when a node already uses it.
+  const genericRegex = new RegExp(`(^|\\n)(\\s*)${sid}\\s*@\\{([\\s\\S]*?)\\}`, "m");
+  const genericMatch = output.match(genericRegex);
+  if (genericMatch && /\blabel\s*:/i.test(genericMatch[3])) {
+    const body = genericMatch[3].replace(
+      /\blabel\s*:\s*"((?:\\.|[^"\\])*)"/i,
+      `label: "${mermaidString(cleanLabel)}"`
+    );
+    output = output.replace(genericRegex, (_, prefix, indent) => `${prefix}${indent}${nodeId}@{${body}}`);
+
+    const shapeCode = SHAPE_DIRECTIVES[shapeValue] || "rect";
+    const shapeRegexModern = new RegExp(`(^|\\n)(\\s*)${sid}\\s*@\\{\\s*shape\\s*:\s*[^}]+\\}`, "mi");
+    if (shapeRegexModern.test(output)) {
+      output = output.replace(shapeRegexModern, (_, prefix, indent) => `${prefix}${indent}${nodeId}@{ shape: ${shapeCode}}`);
+    } else {
+      output = `${output.trimEnd()}\n    ${nodeId}@{ shape: ${shapeCode}}\n`;
+    }
+    return output;
+  }
+
+  const replacement = nodeSyntax(nodeId, cleanLabel, shapeValue);
   for (const shape of SHAPES.slice().sort((a, b) => b.open.length - a.open.length)) {
     const regex = shapeRegex(shape, nodeId);
-    if (regex.test(code)) {
-      return code.replace(regex, (_, prefix) => `${prefix}${replacement}`);
+    if (regex.test(output)) {
+      output = output.replace(regex, (_, prefix) => `${prefix}${replacement}`);
+      return output;
     }
   }
-  return insertAtRoot(code, `    ${replacement}`);
+  return insertAtRoot(output, `    ${replacement}`);
 }
 
 function stripNodeShapeEverywhere(code, nodeId) {
@@ -187,40 +257,134 @@ function addSubgraphToCode(code, subgraphId, title, defaultNodeId) {
 
 function addEdgeToCode(code, sourceId, targetId) {
   if (!sourceId || !targetId || sourceId === targetId) return code;
-  const edgePattern = new RegExp(`(^|\n)\s*${escapeRegExp(sourceId)}\s*--+>\s*${escapeRegExp(targetId)}(?:\s|$)`, "m");
+  const edgePattern = new RegExp(`(^|\\n)\\s*${escapeRegExp(sourceId)}\\s*--+>\\s*${escapeRegExp(targetId)}(?:\\s|$)`, "m");
   if (edgePattern.test(code)) return code;
   return `${code.trimEnd()}\n    ${sourceId} --> ${targetId}\n`;
+}
+
+function removeTargetFromEdgeLine(line, sourceId, targetId) {
+  const sid = escapeRegExp(sourceId);
+  const tid = escapeRegExp(targetId);
+  if (!new RegExp(`^\\s*${sid}\\b`).test(line) || !/-->|==>|-.->|---/.test(line)) return line;
+
+  // Remove one destination from Mermaid fan-out syntax: A --> B & C & D
+  const arrowMatch = line.match(/^(\s*[^=\n]*?)(-->|==>|-.->|---)([\s\S]*)$/);
+  if (!arrowMatch) return line;
+  const prefix = arrowMatch[1];
+  const arrow = arrowMatch[2];
+  const rhs = arrowMatch[3];
+  const parts = rhs.split(/\s*&\s*/);
+  const kept = parts.filter((part) => !new RegExp(`^\\s*${tid}(?:\\b|\\s*[\\[({@])`).test(part));
+  if (kept.length === parts.length) return line;
+  if (!kept.length) return "";
+  return `${prefix}${arrow} ${kept.map((p) => p.trim()).join(" & ")}`;
 }
 
 function removeNodeFromCode(code, nodeId) {
   const sid = escapeRegExp(nodeId);
   const lines = code.split("\n");
-  const nodeToken = new RegExp(`(^|[^A-Za-z0-9_-])${sid}([^A-Za-z0-9_-]|$)`);
-  const declarationOnly = new RegExp(`^\s*${sid}(?:\s*[\[({])`);
+  const out = [];
 
-  return lines
-    .filter((line) => {
-      if (!nodeToken.test(line)) return true;
-      // Delete all edges involving the node. This intentionally disconnects it.
-      if (/-->|---|==>|-.->|~~~/.test(line)) return false;
-      // Delete a standalone node declaration.
-      if (declarationOnly.test(line)) return false;
-      return true;
-    })
-    .join("\n");
+  for (const original of lines) {
+    let line = original;
+    const trimmed = line.trim();
+
+    // Dedicated declaration / style line for this node.
+    if (new RegExp(`^${sid}\\s*(?:@\\{|\\[|\\(|\\{)`, "i").test(trimmed)) continue;
+
+    // If the deleted node is the source of an edge, remove that edge statement.
+    if (new RegExp(`^${sid}\\b`, "i").test(trimmed) && /-->|==>|-.->|---/.test(trimmed)) continue;
+
+    // Remove it when it is one member of a fan-out destination list.
+    const sourceMatch = line.match(/^\s*([A-Za-z_][A-Za-z0-9_-]*)\b/);
+    if (sourceMatch && /-->|==>|-.->|---/.test(line)) {
+      line = removeTargetFromEdgeLine(line, sourceMatch[1], nodeId);
+      if (!line.trim()) continue;
+    }
+
+    // Conservative fallback for one-to-one edge statements where the target is the deleted node.
+    if (/-->|==>|-.->|---/.test(line) && new RegExp(`(?:-->|==>|-.->|---)\\s*${sid}(?:\\b|\\s*[\\[({@])`, "i").test(line)) continue;
+
+    out.push(line);
+  }
+
+  return out.join("\n");
+}
+
+function collectNumberedIds(code, prefix) {
+  const regex = new RegExp(`\\b${escapeRegExp(prefix)}(\\d+)\\b`, "gi");
+  let max = 0;
+  for (const match of code.matchAll(regex)) max = Math.max(max, Number(match[1]) || 0);
+  return max;
 }
 
 function nextNodeId(code) {
-  let index = 1;
-  while (new RegExp(`(^|[^A-Za-z0-9_-])N${index}([^A-Za-z0-9_-]|$)`, "m").test(code)) index += 1;
-  return `N${index}`;
+  // Continue after the highest existing n/N number instead of filling gaps.
+  // Example: n1 ... n64 => n65. This avoids collisions in imported diagrams.
+  const max = collectNumberedIds(code, "n");
+  return `n${max + 1}`;
 }
 
 function nextSubgraphId(code) {
+  const max = Math.max(
+    collectNumberedIds(code, "s"),
+    collectNumberedIds(code, "SG")
+  );
+  return `s${max + 1}`;
+}
+
+function replaceSubgraphTitle(code, subgraphId, title) {
+  const sid = escapeRegExp(subgraphId);
+  const re = new RegExp(`(^|\\n)(\\s*)subgraph\\s+${sid}(?:\\s*\\[[^\\]]*\\])?`, "mi");
+  return code.replace(re, (_, prefix, indent) => `${prefix}${indent}subgraph ${subgraphId}["${mermaidString(safeLabel(title))}"]`);
+}
+
+function nodeIdsInsideSubgraph(code, subgraphId) {
+  const group = parseSubgraphs(code).find((item) => item.id === subgraphId);
+  if (!group) return [];
+  const lines = code.split("\n").slice(group.start + 1, group.end);
+  const ids = new Set();
+  for (const line of lines) {
+    const match = line.match(/^\s*([A-Za-z_][A-Za-z0-9_-]*)\s*(?=@\{|\[|\(|\{)/);
+    if (match) ids.add(match[1]);
+  }
+  return [...ids];
+}
+
+function deleteSubgraphFromCode(code, subgraphId) {
   const groups = parseSubgraphs(code);
-  let index = 1;
-  while (groups.some((group) => group.id === `SG${index}`)) index += 1;
-  return `SG${index}`;
+  const group = groups.find((item) => item.id === subgraphId);
+  if (!group) return code;
+  const nodeIds = nodeIdsInsideSubgraph(code, subgraphId);
+  const lines = code.split("\n");
+  lines.splice(group.start, group.end - group.start + 1);
+  let output = lines.join("\n");
+  for (const nodeId of nodeIds) output = removeNodeFromCode(output, nodeId);
+  return output;
+}
+
+function removeEdgeFromCode(code, sourceId, targetId) {
+  const lines = code.split("\n");
+  let removed = false;
+  const out = [];
+  for (let line of lines) {
+    if (!removed) {
+      const next = removeTargetFromEdgeLine(line, sourceId, targetId);
+      if (next !== line) {
+        removed = true;
+        line = next;
+      } else {
+        const sid = escapeRegExp(sourceId);
+        const tid = escapeRegExp(targetId);
+        if (new RegExp(`^\\s*${sid}\\b[\\s\\S]*?(?:-->|==>|-.->|---)\\s*${tid}(?:\\b|\\s*[\\[({@])`, "i").test(line)) {
+          removed = true;
+          continue;
+        }
+      }
+    }
+    if (line.trim()) out.push(line);
+  }
+  return out.join("\n");
 }
 
 function findNodeSubgraph(code, nodeId) {
@@ -267,6 +431,26 @@ function extractClusterId(element) {
   return match ? match[1] : raw;
 }
 
+function extractEdgeInfo(element) {
+  const candidate = element.closest?.("g.edgePath, g.edgePaths, g") || element;
+  const classText = `${candidate?.getAttribute?.("class") || ""} ${element?.getAttribute?.("class") || ""}`;
+  const sourceClass = classText.match(/(?:^|\s)LS-([^\s]+)/);
+  const targetClass = classText.match(/(?:^|\s)LE-([^\s]+)/);
+  if (sourceClass && targetClass) return { source: sourceClass[1], target: targetClass[1] };
+
+  const attrs = [candidate, element];
+  for (const el of attrs) {
+    if (!el?.getAttribute) continue;
+    const source = el.getAttribute("data-source") || el.getAttribute("data-from");
+    const target = el.getAttribute("data-target") || el.getAttribute("data-to");
+    if (source && target) return { source, target };
+    const raw = el.id || "";
+    const match = raw.match(/(?:^|-)L_([A-Za-z0-9_-]+)_([A-Za-z0-9_-]+)_\d+$/);
+    if (match) return { source: match[1], target: match[2] };
+  }
+  return null;
+}
+
 export default function App() {
   const firstLoad = useMemo(() => loadProjects(), []);
   const [projects, setProjects] = useState(firstLoad);
@@ -281,6 +465,7 @@ export default function App() {
   const [nodeTarget, setNodeTarget] = useState("");
   const [newSubgraphTitle, setNewSubgraphTitle] = useState("Nhóm mới");
   const [inlineEdit, setInlineEdit] = useState(null);
+  const [inlineSubgraphEdit, setInlineSubgraphEdit] = useState(null);
   const [view, setView] = useState({ x: 0, y: 0, scale: 1 });
   const [editorWidth, setEditorWidth] = useState(430);
   const [connectionDrag, setConnectionDrag] = useState(null);
@@ -290,6 +475,7 @@ export default function App() {
   const canvasRef = useRef(null);
   const panRef = useRef(null);
   const splitterRef = useRef(null);
+  const codeEditorRef = useRef(null);
 
   const active = useMemo(
     () => projects.find((p) => p.id === activeId) ?? projects[0],
@@ -360,11 +546,20 @@ export default function App() {
       event.stopPropagation();
 
       if (event.ctrlKey || event.metaKey) {
-        const delta = event.deltaY < 0 ? 0.1 : -0.1;
-        setView((v) => ({
-          ...v,
-          scale: Math.min(3, Math.max(0.25, Number((v.scale + delta).toFixed(2))))
-        }));
+        const rect = viewport.getBoundingClientRect();
+        const mouseX = event.clientX - rect.left;
+        const mouseY = event.clientY - rect.top;
+        const factor = event.deltaY < 0 ? 1.12 : 1 / 1.12;
+        setView((v) => {
+          const nextScale = Math.min(3, Math.max(0.25, v.scale * factor));
+          const worldX = (mouseX - v.x) / v.scale;
+          const worldY = (mouseY - v.y) / v.scale;
+          return {
+            scale: nextScale,
+            x: mouseX - worldX * nextScale,
+            y: mouseY - worldY * nextScale
+          };
+        });
         return;
       }
 
@@ -382,6 +577,20 @@ export default function App() {
   }, [active?.id]);
 
   useEffect(() => {
+    const editor = codeEditorRef.current;
+    if (!editor) return;
+    const onEditorWheel = (event) => {
+      // Keep wheel scrolling inside the source editor and prevent scroll chaining to the page.
+      event.preventDefault();
+      event.stopPropagation();
+      if (event.shiftKey) editor.scrollLeft += event.deltaY || event.deltaX;
+      else editor.scrollTop += event.deltaY;
+    };
+    editor.addEventListener("wheel", onEditorWheel, { passive: false });
+    return () => editor.removeEventListener("wheel", onEditorWheel);
+  }, [active?.id]);
+
+  useEffect(() => {
     const canvas = canvasRef.current;
     const viewport = viewportRef.current;
     if (!canvas || !viewport || !svg) return;
@@ -396,25 +605,39 @@ export default function App() {
       return { nodeId, def };
     };
 
+    const findCluster = (target) => {
+      const cluster = target.closest?.("g.cluster");
+      if (!cluster) return null;
+      const clusterId = extractClusterId(cluster);
+      return subgraphs.find((item) => item.id === clusterId) ||
+        subgraphs.find((item) => cluster.textContent?.includes(item.title)) || null;
+    };
+
     const onClick = (event) => {
       if (event.target.closest?.("g.visual-subgraph-add")) return;
       const node = event.target.closest?.("g.node");
       if (node) {
         event.stopPropagation();
+        viewport.focus({ preventScroll: true });
         selectNode(node);
         return;
       }
 
-      const cluster = event.target.closest?.("g.cluster");
-      if (cluster) {
+      const edgeElement = event.target.closest?.("g.edgePath, path.flowchart-link, .edgePaths path, .edgePath path");
+      const edgeInfo = edgeElement ? extractEdgeInfo(edgeElement) : null;
+      if (edgeInfo) {
         event.stopPropagation();
-        const clusterId = extractClusterId(cluster);
-        const group = subgraphs.find((item) => item.id === clusterId) ||
-          subgraphs.find((item) => cluster.textContent?.includes(item.title));
-        if (group) {
-          setSelected({ type: "subgraph", id: group.id });
-          setNodeTarget(group.id);
-        }
+        viewport.focus({ preventScroll: true });
+        setSelected({ type: "edge", source: edgeInfo.source, target: edgeInfo.target, id: `${edgeInfo.source}→${edgeInfo.target}` });
+        return;
+      }
+
+      const group = findCluster(event.target);
+      if (group) {
+        event.stopPropagation();
+        viewport.focus({ preventScroll: true });
+        setSelected({ type: "subgraph", id: group.id });
+        setNodeTarget(group.id);
         return;
       }
 
@@ -423,17 +646,32 @@ export default function App() {
 
     const onDoubleClick = (event) => {
       const node = event.target.closest?.("g.node");
-      if (!node) return;
-      event.preventDefault();
-      event.stopPropagation();
-      const { nodeId, def } = selectNode(node);
       const bounds = viewport.getBoundingClientRect();
-      setInlineEdit({
-        id: nodeId,
-        value: def.label || nodeId,
-        x: Math.max(8, Math.min(bounds.width - 260, event.clientX - bounds.left + 12)),
-        y: Math.max(8, Math.min(bounds.height - 90, event.clientY - bounds.top + 12))
-      });
+      if (node) {
+        event.preventDefault();
+        event.stopPropagation();
+        const { nodeId, def } = selectNode(node);
+        setInlineEdit({
+          id: nodeId,
+          value: def.label || nodeId,
+          x: Math.max(8, Math.min(bounds.width - 260, event.clientX - bounds.left + 12)),
+          y: Math.max(8, Math.min(bounds.height - 90, event.clientY - bounds.top + 12))
+        });
+        return;
+      }
+
+      const group = findCluster(event.target);
+      if (group) {
+        event.preventDefault();
+        event.stopPropagation();
+        setSelected({ type: "subgraph", id: group.id });
+        setInlineSubgraphEdit({
+          id: group.id,
+          value: group.title,
+          x: Math.max(8, Math.min(bounds.width - 300, event.clientX - bounds.left + 12)),
+          y: Math.max(8, Math.min(bounds.height - 90, event.clientY - bounds.top + 12))
+        });
+      }
     };
 
     canvas.addEventListener("click", onClick);
@@ -448,18 +686,26 @@ export default function App() {
     const canvas = canvasRef.current;
     if (!canvas) return;
     canvas.querySelectorAll(".visual-selected").forEach((el) => el.classList.remove("visual-selected"));
+    canvas.querySelectorAll(".visual-edge-selected").forEach((el) => el.classList.remove("visual-edge-selected"));
     if (!selected) return;
 
     if (selected.type === "node") {
       canvas.querySelectorAll("g.node").forEach((el) => {
         if (extractNodeId(el) === selected.id) el.classList.add("visual-selected");
       });
-    } else {
+    } else if (selected.type === "subgraph") {
       canvas.querySelectorAll("g.cluster").forEach((el) => {
         const cid = extractClusterId(el);
         const group = subgraphs.find((item) => item.id === selected.id);
         if (cid === selected.id || (group && el.textContent?.includes(group.title))) {
           el.classList.add("visual-selected");
+        }
+      });
+    } else if (selected.type === "edge") {
+      canvas.querySelectorAll("g.edgePath, path.flowchart-link, .edgePaths path, .edgePath path").forEach((el) => {
+        const info = extractEdgeInfo(el);
+        if (info?.source === selected.source && info?.target === selected.target) {
+          (el.closest?.("g.edgePath") || el).classList.add("visual-edge-selected");
         }
       });
     }
@@ -623,18 +869,18 @@ export default function App() {
   }, [svg, active?.visual, active?.code, subgraphs]);
 
   useEffect(() => {
-    const viewport = viewportRef.current;
-    if (!viewport) return;
     const onKeyDown = (event) => {
       const tag = event.target?.tagName?.toLowerCase();
       if (tag === "input" || tag === "textarea" || tag === "select" || event.target?.isContentEditable) return;
-      if ((event.key === "Delete" || event.key === "Backspace") && selected?.type === "node") {
+      if (event.key === "Delete" || event.key === "Backspace") {
+        if (!selected) return;
         event.preventDefault();
-        deleteSelectedNode();
+        event.stopPropagation();
+        deleteSelection();
       }
     };
-    viewport.addEventListener("keydown", onKeyDown);
-    return () => viewport.removeEventListener("keydown", onKeyDown);
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
   }, [selected, active?.code]);
 
   function updateActive(patch) {
@@ -772,6 +1018,31 @@ export default function App() {
     setInlineEdit(null);
   }
 
+  function deleteSelectedSubgraph() {
+    if (selected?.type !== "subgraph") return;
+    updateCode(deleteSubgraphFromCode(active.code, selected.id));
+    setSelected(null);
+    setInlineSubgraphEdit(null);
+  }
+
+  function deleteSelectedEdge() {
+    if (selected?.type !== "edge") return;
+    updateCode(removeEdgeFromCode(active.code, selected.source, selected.target));
+    setSelected(null);
+  }
+
+  function deleteSelection() {
+    if (selected?.type === "node") deleteSelectedNode();
+    else if (selected?.type === "subgraph") deleteSelectedSubgraph();
+    else if (selected?.type === "edge") deleteSelectedEdge();
+  }
+
+  function commitSubgraphInlineEdit() {
+    if (!inlineSubgraphEdit?.id) return;
+    updateCode(replaceSubgraphTitle(active.code, inlineSubgraphEdit.id, inlineSubgraphEdit.value));
+    setInlineSubgraphEdit(null);
+  }
+
   function addSubgraph() {
     const sgId = nextSubgraphId(active.code);
     const nodeId = nextNodeId(active.code);
@@ -833,7 +1104,7 @@ export default function App() {
       <header className="topbar">
         <div className="brand">
           <div className="brand-mark">M</div>
-          <div><strong>Mermaid Live Lite v4</strong><span>Visual editor + Mermaid source</span></div>
+          <div><strong>Mermaid Live Lite v5</strong><span>Visual editor + Mermaid source</span></div>
         </div>
 
         <div className="toolbar">
@@ -876,7 +1147,7 @@ export default function App() {
             <input className="sidebar-input" value={newSubgraphTitle} onChange={(e) => setNewSubgraphTitle(e.target.value)} placeholder="Tên subgraph" />
             <button className="new-subgraph-button" onClick={addSubgraph}>＋ Thêm subgraph</button>
           </div>
-          <div className="sidebar-note">Chuột phải + kéo: PAN · Cuộn: lên/xuống · Shift + cuộn: trái/phải · Ctrl + cuộn: zoom · Double click node: sửa tên.</div>
+          <div className="sidebar-note">Chuột phải + kéo: PAN · Cuộn: lên/xuống · Shift + cuộn: trái/phải · Ctrl + cuộn: zoom tại con trỏ · Double click node/subgraph: sửa tên · Click line + Delete: xóa kết nối.</div>
         </aside>
 
         <section className="editor-pane">
@@ -884,7 +1155,7 @@ export default function App() {
             <input className="title-input" value={active.name} onChange={(e) => updateActive({ name: e.target.value })} aria-label="Tên sơ đồ" />
             <span className="status">{error ? "Syntax error" : "Live"}</span>
           </div>
-          <textarea className="code-editor" spellCheck="false" value={active.code} onChange={(e) => updateCode(e.target.value)} aria-label="Mermaid code" />
+          <textarea ref={codeEditorRef} className="code-editor" spellCheck="false" value={active.code} onChange={(e) => updateCode(e.target.value)} aria-label="Mermaid code" />
           {error && <div className="error-box"><strong>Mermaid không render được</strong><pre>{error}</pre></div>}
         </section>
 
@@ -963,6 +1234,17 @@ export default function App() {
               </div>
             )}
 
+            {selected?.type === "edge" && (
+              <div className="node-popover edge-popover" onPointerDown={(e) => e.stopPropagation()}>
+                <div className="node-popover-head">
+                  <strong>{selected.source} → {selected.target}</strong>
+                  <button className="delete-node-button" onClick={deleteSelectedEdge} title="Xóa kết nối">×</button>
+                </div>
+                <button className="danger-soft" onClick={deleteSelectedEdge}>Delete connection</button>
+                <small>Click đường nối rồi bấm Delete/Backspace cũng có thể xóa kết nối.</small>
+              </div>
+            )}
+
             {inlineEdit && (
               <div className="inline-node-editor" style={{ left: inlineEdit.x, top: inlineEdit.y }}>
                 <input
@@ -976,6 +1258,22 @@ export default function App() {
                 />
                 <button className="primary" onClick={commitInlineEdit}>Lưu</button>
                 <button onClick={() => setInlineEdit(null)}>Hủy</button>
+              </div>
+            )}
+
+            {inlineSubgraphEdit && (
+              <div className="inline-node-editor" style={{ left: inlineSubgraphEdit.x, top: inlineSubgraphEdit.y }}>
+                <input
+                  autoFocus
+                  value={inlineSubgraphEdit.value}
+                  onChange={(e) => setInlineSubgraphEdit((v) => ({ ...v, value: e.target.value }))}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") commitSubgraphInlineEdit();
+                    if (e.key === "Escape") setInlineSubgraphEdit(null);
+                  }}
+                />
+                <button className="primary" onClick={commitSubgraphInlineEdit}>Lưu</button>
+                <button onClick={() => setInlineSubgraphEdit(null)}>Hủy</button>
               </div>
             )}
           </div>
@@ -1003,8 +1301,14 @@ export default function App() {
               </div>
             ) : selected?.type === "subgraph" ? (
               <div className="subgraph-tools">
-                <p>Node mới sẽ được thêm trực tiếp vào <strong>{selected.id}</strong>.</p>
+                <p>Node mới sẽ được thêm trực tiếp vào <strong>{selected.id}</strong>. Double click khung subgraph để sửa tên.</p>
                 <button className="primary" onClick={() => addNodeToSubgraph(selected.id, "rect")}>＋ Thêm node vào subgraph</button>
+                <button className="danger-soft" onClick={deleteSelectedSubgraph}>Delete subgraph</button>
+              </div>
+            ) : selected?.type === "edge" ? (
+              <div className="subgraph-tools">
+                <p>Kết nối <strong>{selected.source}</strong> → <strong>{selected.target}</strong></p>
+                <button className="danger-soft" onClick={deleteSelectedEdge}>Delete connection</button>
               </div>
             ) : (
               <div className="subgraph-tools">
