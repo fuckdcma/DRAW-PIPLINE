@@ -6,17 +6,28 @@ const LEGACY_STORAGE_KEY = "mermaid-live-lite.projects.v1";
 const THEME_KEY = "mermaid-live-lite.theme.v1";
 
 const SAMPLE = `flowchart TD
-    A[Nhận yêu cầu] --> B{File đã tồn tại?}
-    B -->|Có| C[(Database)]
-    B -->|Không| D[Download]
 
-    subgraph PROCESS[Media Processing]
-        D --> E[FFmpeg]
-        E --> F[AI Processing]
+    subgraph PROCESS["Media Processing"]
+        D["Download"]
+        E["FFmpeg"]
+        F["AI Processing"]
     end
 
-    F --> G[Upload]
-    G --> C`;
+    A["Nhận yêu cầu"] --> B["File đã tồn tại?"]
+    B -->|Có| C["Database"]
+    B -->|Không| D
+    D --> E
+    E --> F
+    F --> G["Upload"]
+    G --> C
+
+    A@{ shape: rect}
+    B@{ shape: diam}
+    C@{ shape: cyl}
+    D@{ shape: rect}
+    E@{ shape: rect}
+    F@{ shape: rect}
+    G@{ shape: rect}`;
 
 const SHAPES = [
   { value: "rect", label: "Chữ nhật", open: "[", close: "]" },
@@ -45,6 +56,65 @@ function mermaidString(value) {
     .replace(/\\/g, "\\\\")
     .replace(/"/g, '\\"')
     .replace(/[\r\n]+/g, " ");
+}
+
+function decodeMermaidLabel(value) {
+  const raw = String(value ?? "").trim();
+  if (
+    (raw.startsWith('"') && raw.endsWith('"')) ||
+    (raw.startsWith("'") && raw.endsWith("'"))
+  ) {
+    const inner = raw.slice(1, -1);
+    if (raw.startsWith('"')) {
+      try {
+        return JSON.parse(`"${inner}"`);
+      } catch {}
+    }
+    return inner.replace(/\\'/g, "'").replace(/\\\\/g, "\\");
+  }
+  return raw;
+}
+
+function canonicalNodeDeclaration(nodeId, label) {
+  return `${nodeId}["${mermaidString(safeLabel(label))}"]`;
+}
+
+function shapeValueFromDirective(raw) {
+  const normalized = String(raw || "").toLowerCase();
+  return (
+    Object.entries(SHAPE_DIRECTIVES).find(([, value]) => value === normalized)?.[0] ||
+    ({ decision: "diamond", cylinder: "cylinder" }[normalized] || "rect")
+  );
+}
+
+function upsertShapeDirective(code, nodeId, shapeValue) {
+  const sid = escapeRegExp(nodeId);
+  const shapeCode = SHAPE_DIRECTIVES[shapeValue] || "rect";
+  const directive = `${nodeId}@{ shape: ${shapeCode}}`;
+  const shapeRegex = new RegExp(
+    `(^|\\n)(\\s*)${sid}\\s*@\\{\\s*shape\\s*:\\s*[^}]+\\}`,
+    "mi"
+  );
+
+  if (shapeRegex.test(code)) {
+    return code.replace(
+      shapeRegex,
+      (_, prefix, indent) => `${prefix}${indent}${directive}`
+    );
+  }
+
+  return `${code.trimEnd()}\n    ${directive}\n`;
+}
+
+function removeShapeDirective(code, nodeId) {
+  const sid = escapeRegExp(nodeId);
+  return code
+    .split("\n")
+    .filter(
+      (line) =>
+        !new RegExp(`^\\s*${sid}\\s*@\\{\\s*shape\\s*:`, "i").test(line)
+    )
+    .join("\n");
 }
 
 function uid() {
@@ -148,14 +218,17 @@ function findNodeDefinition(code, nodeId) {
     const shapeMatch = match[2].match(/\bshape\s*:\s*([A-Za-z0-9_-]+)/i);
     if (shapeMatch) {
       const raw = shapeMatch[1].toLowerCase();
-      directiveShape = Object.entries(SHAPE_DIRECTIVES).find(([, value]) => value === raw)?.[0] ||
-        ({ decision: "diamond", cylinder: "cylinder" }[raw] || "rect");
+      directiveShape = shapeValueFromDirective(raw);
     }
   }
 
   for (const shape of SHAPES.slice().sort((a, b) => b.open.length - a.open.length)) {
     const match = code.match(shapeRegex(shape, nodeId));
-    if (match) return { shape: directiveShape || shape.value, label: genericLabel || match[3], match };
+    if (match) return {
+      shape: directiveShape || shape.value,
+      label: genericLabel || decodeMermaidLabel(match[3]),
+      match
+    };
   }
 
   if (generic) return { shape: directiveShape || "rect", label: genericLabel || nodeId, match: generic };
@@ -163,8 +236,9 @@ function findNodeDefinition(code, nodeId) {
 }
 
 function nodeSyntax(nodeId, label, shapeValue) {
-  const shape = SHAPES.find((item) => item.value === shapeValue) || SHAPES[0];
-  return `${nodeId}${shape.open}${safeLabel(label)}${shape.close}`;
+  // Keep label syntax stable and compatible with the imported Mermaid Chart source.
+  // Shape is stored separately as `nodeId@{ shape: ... }`.
+  return canonicalNodeDeclaration(nodeId, label);
 }
 
 function replaceNodeDefinition(code, nodeId, label, shapeValue) {
@@ -172,35 +246,51 @@ function replaceNodeDefinition(code, nodeId, label, shapeValue) {
   const cleanLabel = safeLabel(label);
   let output = code;
 
-  // Preserve Mermaid's generic @{ label: ... } syntax when a node already uses it.
-  const genericRegex = new RegExp(`(^|\\n)(\\s*)${sid}\\s*@\\{([\\s\\S]*?)\\}`, "m");
-  const genericMatch = output.match(genericRegex);
-  if (genericMatch && /\blabel\s*:/i.test(genericMatch[3])) {
+  // Preserve a generic `@{ label: "..." }` declaration if the imported
+  // source already uses it (usually for complex HTML labels).
+  const genericLabelRegex = new RegExp(
+    `(^|\\n)(\\s*)${sid}\\s*@\\{([\\s\\S]*?\\blabel\\s*:[\\s\\S]*?)\\}`,
+    "m"
+  );
+  const genericMatch = output.match(genericLabelRegex);
+
+  if (genericMatch) {
     const body = genericMatch[3].replace(
       /\blabel\s*:\s*"((?:\\.|[^"\\])*)"/i,
       `label: "${mermaidString(cleanLabel)}"`
     );
-    output = output.replace(genericRegex, (_, prefix, indent) => `${prefix}${indent}${nodeId}@{${body}}`);
-
-    const shapeCode = SHAPE_DIRECTIVES[shapeValue] || "rect";
-    const shapeRegexModern = new RegExp(`(^|\\n)(\\s*)${sid}\\s*@\\{\\s*shape\\s*:\s*[^}]+\\}`, "mi");
-    if (shapeRegexModern.test(output)) {
-      output = output.replace(shapeRegexModern, (_, prefix, indent) => `${prefix}${indent}${nodeId}@{ shape: ${shapeCode}}`);
-    } else {
-      output = `${output.trimEnd()}\n    ${nodeId}@{ shape: ${shapeCode}}\n`;
+    output = output.replace(
+      genericLabelRegex,
+      (_, prefix, indent) => `${prefix}${indent}${nodeId}@{${body}}`
+    );
+  } else {
+    // Normalize any old shape-encoded declaration such as:
+    // n1([Text]), n1{Text}, n1((Text)) -> n1["Text"]
+    let replaced = false;
+    for (const shape of SHAPES.slice().sort((a, b) => b.open.length - a.open.length)) {
+      const regex = shapeRegex(shape, nodeId);
+      if (regex.test(output)) {
+        output = output.replace(
+          regex,
+          (_, prefix) => `${prefix}${canonicalNodeDeclaration(nodeId, cleanLabel)}`
+        );
+        replaced = true;
+        break;
+      }
     }
-    return output;
+
+    if (!replaced) {
+      output = insertAtRoot(
+        output,
+        `    ${canonicalNodeDeclaration(nodeId, cleanLabel)}`
+      );
+    }
   }
 
-  const replacement = nodeSyntax(nodeId, cleanLabel, shapeValue);
-  for (const shape of SHAPES.slice().sort((a, b) => b.open.length - a.open.length)) {
-    const regex = shapeRegex(shape, nodeId);
-    if (regex.test(output)) {
-      output = output.replace(regex, (_, prefix) => `${prefix}${replacement}`);
-      return output;
-    }
-  }
-  return insertAtRoot(output, `    ${replacement}`);
+  // Shape is always a separate Mermaid directive, matching the source style:
+  // n64["List Movies"]
+  // n64@{ shape: rect}
+  return upsertShapeDirective(output, nodeId, shapeValue);
 }
 
 function stripNodeShapeEverywhere(code, nodeId) {
@@ -241,18 +331,54 @@ function insertIntoSubgraph(code, subgraphId, line) {
 
 function moveNodeToSubgraph(code, nodeId, targetSubgraphId) {
   const def = findNodeDefinition(code, nodeId);
-  let output = stripNodeShapeEverywhere(code, nodeId);
-  output = removeStandaloneNodeLine(output, nodeId);
-  const declaration = nodeSyntax(nodeId, def.label || nodeId, def.shape);
-  return targetSubgraphId
+  let output = code;
+
+  // Remove only the declaration from its current location. Keep connections.
+  for (const shape of SHAPES.slice().sort((a, b) => b.open.length - a.open.length)) {
+    const sid = escapeRegExp(nodeId);
+    const open = escapeRegExp(shape.open);
+    const close = escapeRegExp(shape.close);
+    const standalone = new RegExp(
+      `^\\s*${sid}\\s*${open}[^\\n]*?${close}\\s*$`
+    );
+    output = output
+      .split("\n")
+      .filter((line) => !standalone.test(line))
+      .join("\n");
+  }
+
+  // Generic label declarations are also valid standalone node declarations.
+  const sid = escapeRegExp(nodeId);
+  output = output
+    .split("\n")
+    .filter(
+      (line) =>
+        !new RegExp(
+          `^\\s*${sid}\\s*@\\{[^}]*\\blabel\\s*:`,
+          "i"
+        ).test(line)
+    )
+    .join("\n");
+
+  const declaration = canonicalNodeDeclaration(
+    nodeId,
+    def.label || nodeId
+  );
+
+  output = targetSubgraphId
     ? insertIntoSubgraph(output, targetSubgraphId, declaration)
     : insertAtRoot(output, `    ${declaration}`);
+
+  return upsertShapeDirective(output, nodeId, def.shape || "rect");
 }
 
 function addSubgraphToCode(code, subgraphId, title, defaultNodeId) {
   const nodeId = defaultNodeId || "N1";
-  const block = `\n    subgraph ${subgraphId}[${safeLabel(title)}]\n        ${nodeSyntax(nodeId, "Untitled Node", "rect")}\n    end`;
-  return `${code.trimEnd()}${block}\n`;
+  const block =
+    `\n    subgraph ${subgraphId}["${mermaidString(safeLabel(title))}"]` +
+    `\n        ${canonicalNodeDeclaration(nodeId, "Untitled Node")}` +
+    `\n    end`;
+  return upsertShapeDirective(`${code.trimEnd()}${block}\n`, nodeId, "rect");
 }
 
 function addEdgeToCode(code, sourceId, targetId) {
@@ -1121,11 +1247,13 @@ export default function App() {
   function addNode(connectFromSelected = false, shapeValue = "rect", forcedTarget = null, forcedLabel = null) {
     const nodeId = nextNodeId(active.code);
     const label = forcedLabel || `Node ${nodeId}`;
-    const declaration = nodeSyntax(nodeId, label, shapeValue);
+    const declaration = canonicalNodeDeclaration(nodeId, label);
     const target = forcedTarget ?? (selected?.type === "subgraph" ? selected.id : "");
     let code = target
       ? insertIntoSubgraph(active.code, target, declaration)
       : insertAtRoot(active.code, `    ${declaration}`);
+
+    code = upsertShapeDirective(code, nodeId, shapeValue);
 
     if (connectFromSelected && selected?.type === "node") {
       code = `${code.trimEnd()}
@@ -1273,7 +1401,7 @@ export default function App() {
       <header className="topbar">
         <div className="brand">
           <div className="brand-mark">M</div>
-          <div><strong>Mermaid Live Lite v6</strong><span>Visual editor + Mermaid source</span></div>
+          <div><strong>Mermaid Live Lite v7</strong><span>Visual editor + Mermaid source</span></div>
         </div>
 
         <div className="toolbar">
